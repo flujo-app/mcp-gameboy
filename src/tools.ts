@@ -1,154 +1,41 @@
-import { 
-  CallToolResult,
-  ImageContent,
-  TextContent
-} from '@modelcontextprotocol/sdk/types.js';
+import { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
-import { GameBoyButton } from './types';
-import { EmulatorService } from './emulatorService'; // Import EmulatorService
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import * as fs from 'fs';
-import * as path from 'path';
-import { log } from './utils/logger';
+import { EmulatorService } from './emulatorService.js';
+import { BUTTONS, type GameBoyButton, type FrameResult } from './types.js';
 
-/**
- * Register GameBoy tools with the MCP server
- * @param server MCP server instance
- * @param emulatorService Emulator service instance
- */
-export function registerGameBoyTools(server: McpServer, emulatorService: EmulatorService): void {
-  // Register button press tools
-  Object.values(GameBoyButton).forEach(button => {
-    server.tool(
-      `press_${button.toLowerCase()}`,
-      `Press the ${button} button on the GameBoy`,
-      {
-        duration_frames: z.number().int().positive().optional().default(1).describe('Number of frames to hold the button').default(25)
-      },
-      async ({ duration_frames }): Promise<CallToolResult> => {
-        // Press the button using the service (advances one frame)
-        emulatorService.pressButton(button, duration_frames);
-
-        // Return the current screen using the service
-        const screen = emulatorService.getScreen();
-        return { content: [screen] };
-      }
-    );
+const frames = (value: number) => z.number().int().min(1).max(600).default(value);
+const none = z.object({}).strict();
+export const definitions = [
+  ...BUTTONS.map(button => ({ name: 'press_' + button.toLowerCase(), description: 'Press ' + button + ' for 1–600 frames, then release for one frame.', schema: z.object({ duration_frames: frames(25) }).strict(), readOnly: false })),
+  { name: 'wait_frames', description: 'Advance 1–600 frames without pressing buttons.', schema: z.object({ duration_frames: frames(100) }).strict(), readOnly: false },
+  { name: 'load_rom', description: 'Load a .gb/.gbc file inside ROM_DIR (or the exact configured ROM_PATH), replacing the current cartridge.', schema: z.object({ romPath: z.string().min(1).max(4096) }).strict(), readOnly: false },
+  { name: 'get_screen', description: 'Advance one frame and return the 160×144 PNG screen.', schema: none, readOnly: false },
+  { name: 'is_rom_loaded', description: 'Read emulator availability, loaded cartridge and frame count.', schema: none, readOnly: true },
+  { name: 'list_roms', description: 'List regular .gb/.gbc files in the configured ROM_DIR.', schema: none, readOnly: true }
+];
+const screenshot = (frame: FrameResult) => ({ content: [{ type: 'image' as const, data: frame.png, mimeType: 'image/png' }] });
+const text = (value: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(value) }] });
+export async function invokeTool(service: EmulatorService, name: string, args: unknown, signal?: AbortSignal) {
+  const definition = definitions.find(tool => tool.name === name);
+  if (!definition) throw new Error('Unknown tool: ' + name);
+  const input = definition.schema.parse(args ?? {}) as { duration_frames?: number; romPath?: string };
+  if (name.startsWith('press_')) return screenshot(await service.pressButton(name.slice(6).toUpperCase() as GameBoyButton, input.duration_frames!, signal));
+  switch (name) {
+    case 'load_rom': return screenshot(await service.loadRom(input.romPath!, signal));
+    case 'wait_frames': return screenshot(await service.advance(input.duration_frames!, signal));
+    case 'get_screen': return screenshot(await service.advance(1, signal));
+    case 'list_roms': return text(await service.roms.list());
+    case 'is_rom_loaded': return text(service.status());
+    default: throw new Error('Unknown tool.');
+  }
+}
+export function registerGameBoyTools(server: McpServer, service: EmulatorService): void {
+  for (const tool of definitions) server.registerTool(tool.name, {
+    description: tool.description,
+    inputSchema: tool.schema,
+    annotations: { readOnlyHint: tool.readOnly, destructiveHint: tool.name === 'load_rom', idempotentHint: tool.readOnly, openWorldHint: false }
+  }, async (args, context) => {
+    try { return await invokeTool(service, tool.name, args, context.mcpReq.signal); }
+    catch (error) { return { isError: true, content: [{ type: 'text' as const, text: error instanceof Error ? error.message : 'Tool failed.' }] }; }
   });
-
-  // Register wait_frames tool
-  server.tool(
-    'wait_frames',
-    'Wait for a specified number of frames',
-    {
-      duration_frames: z.number().int().positive().describe('Number of frames to wait').default(100)
-    },
-    async ({ duration_frames }): Promise<CallToolResult> => {
-      // Wait for frames using the service
-      const screen = emulatorService.waitFrames(duration_frames);
-      return { content: [screen] };
-    }
-  );
-
-  // Register load ROM tool
-  server.tool(
-    'load_rom',
-    'Load a GameBoy ROM file',
-    {
-      romPath: z.string().describe('Path to the ROM file')
-    },
-    async ({ romPath }): Promise<CallToolResult> => {
-      // Load ROM using the service (already advances initial frames)
-      const screen = emulatorService.loadRom(romPath);
-      return { content: [screen] };
-    }
-  );
-
-  // Register get screen tool
-  server.tool(
-    'get_screen',
-    'Get the current GameBoy screen (advances one frame)', // Updated description
-    {},
-    async (): Promise<CallToolResult> => {
-      // Advance one frame and get the screen using the service
-      const screen = emulatorService.advanceFrameAndGetScreen();
-      return { content: [screen] };
-    }
-  );
-
-  // Register is_rom_loaded tool
-  server.tool(
-    'is_rom_loaded',
-    'Check if a ROM is currently loaded in the emulator',
-    {},
-    async (): Promise<CallToolResult> => {
-      const isLoaded = emulatorService.isRomLoaded();
-      const romPath = emulatorService.getRomPath();
-      
-      const responseText: TextContent = {
-        type: 'text',
-        text: JSON.stringify({
-          romLoaded: isLoaded,
-          romPath: romPath || null
-        })
-      };
-      
-      log.verbose('Checked ROM loaded status', JSON.stringify({ 
-        romLoaded: isLoaded, 
-        romPath: romPath || null 
-      }));
-      
-      return { content: [responseText] };
-    }
-  );
-
-  // Register list_roms tool
-  server.tool(
-    'list_roms',
-    'List all available GameBoy ROM files',
-    {},
-    async (): Promise<CallToolResult> => {
-      try {
-        const romsDir = path.join(process.cwd(), 'roms');
-        
-        // Create roms directory if it doesn't exist
-        if (!fs.existsSync(romsDir)) {
-          fs.mkdirSync(romsDir);
-          log.info('Created roms directory');
-        }
-        
-        // Get list of ROM files
-        const romFiles = fs.readdirSync(romsDir)
-          .filter(file => file.endsWith('.gb') || file.endsWith('.gbc'))
-          .map(file => ({
-            name: file,
-            path: path.join(romsDir, file)
-          }));
-        
-        const responseText: TextContent = {
-          type: 'text',
-          text: JSON.stringify(romFiles)
-        };
-        
-        log.verbose('Listed available ROMs', JSON.stringify({ 
-          count: romFiles.length, 
-          roms: romFiles 
-        }));
-        
-        return { content: [responseText] };
-      } catch (error) {
-        log.error('Error listing ROMs:', error instanceof Error ? error.message : String(error));
-        
-        const errorText: TextContent = {
-          type: 'text',
-          text: JSON.stringify({
-            error: 'Failed to list ROMs',
-            message: error instanceof Error ? error.message : String(error)
-          })
-        };
-        
-        return { content: [errorText] };
-      }
-    }
-  );
 }

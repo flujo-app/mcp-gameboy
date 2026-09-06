@@ -36,3 +36,7 @@ Thumbs.db
 mcp-gameboy.log
 roms/example.gb
 roms/Pokemon Red.gb
+
+# Locally supplied cartridges and release archives
+roms/
+*.tgz

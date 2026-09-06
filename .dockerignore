@@ -1,0 +1,9 @@
+**
+!package.json
+!package-lock.json
+!tsconfig.json
+!src/**
+!vendor/**
+!LICENSE
+!THIRD_PARTY_NOTICES.md
+!README.md

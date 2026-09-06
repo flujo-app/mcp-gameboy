@@ -1,137 +1,103 @@
-import { GameBoyEmulator } from './gameboy';
-import { GameBoyButton } from './types';
-import { ImageContent } from '@modelcontextprotocol/sdk/types.js';
-import * as fs from 'fs';
-import * as path from 'path';
-import { log } from './utils/logger';
+import { Worker } from 'node:worker_threads';
+import { RomRepository } from './romRepository.js';
+import { BUTTONS, type FrameResult, type GameBoyButton, type WorkerRequest, type WorkerResponse } from './types.js';
 
-/**
- * Service class to encapsulate GameBoyEmulator interactions.
- */
+interface Job {
+  request: WorkerRequest; resolve(value: FrameResult): void; reject(error: Error): void;
+  romPath?: string; signal?: AbortSignal; abort?: () => void; timer?: ReturnType<typeof setTimeout>;
+}
+export interface EmulatorOptions { operationTimeoutMs?: number; loadTimeoutMs?: number; maxQueued?: number; }
 export class EmulatorService {
-  private emulator: GameBoyEmulator;
-
-  constructor(emulator: GameBoyEmulator) {
-    this.emulator = emulator;
-    log.info('EmulatorService initialized');
-  }
-
-  /**
-   * Checks if a ROM is currently loaded.
-   * @returns True if a ROM is loaded, false otherwise.
-   */
-  isRomLoaded(): boolean {
-    return this.emulator.isRomLoaded();
-  }
-
-  /**
-   * Gets the path of the currently loaded ROM.
-   * @returns The ROM path or undefined if no ROM is loaded.
-   */
-  getRomPath(): string | undefined {
-    return this.emulator.getRomPath();
-  }
-
-  /**
-   * Loads a GameBoy ROM file.
-   * @param romPath Path to the ROM file.
-   * @returns The initial screen content after loading.
-   * @throws Error if the ROM file doesn't exist or fails to load.
-   */
-  loadRom(romPath: string): ImageContent {
-    log.info(`Attempting to load ROM: ${romPath}`);
-    if (!fs.existsSync(romPath)) {
-      log.error(`ROM file not found: ${romPath}`);
-      throw new Error(`ROM file not found: ${romPath}`);
-    }
-
+  private worker?: Worker;
+  private active?: Job;
+  private queue: Job[] = [];
+  private nextId = 1;
+  private reads = 0;
+  private closed = false;
+  private snapshot?: FrameResult;
+  private romPath?: string;
+  constructor(readonly roms: RomRepository, private options: EmulatorOptions = {}) {}
+  status() { return { available: !this.closed, romLoaded: !!this.snapshot, romPath: this.romPath ?? null, frames: this.snapshot?.frames ?? 0, pendingOperations: this.queue.length + (this.active ? 1 : 0) }; }
+  getScreen(): FrameResult { if (!this.snapshot) throw new Error('No ROM loaded.'); return this.snapshot; }
+  async loadRom(value: string, signal?: AbortSignal): Promise<FrameResult> {
+    if (signal?.aborted) throw new Error('Operation cancelled.');
+    if (this.reads >= 4) throw new Error('ROM read capacity reached.');
+    this.reads++;
     try {
-      this.emulator.loadRom(romPath);
-      log.info(`ROM loaded successfully: ${path.basename(romPath)}`);
-
-      // Advance a few frames to initialize the screen
-      for (let i = 0; i < 5; i++) {
-        this.emulator.doFrame();
-      }
-      log.verbose('Advanced initial frames after ROM load');
-
-      return this.getScreen();
-    } catch (error) {
-      log.error(`Error loading ROM: ${romPath}`, error instanceof Error ? error.message : String(error));
-      throw new Error(`Failed to load ROM: ${romPath}. Reason: ${error instanceof Error ? error.message : String(error)}`);
-    }
+      const rom = await this.roms.read(value);
+      return this.submit({ operation: 'load', rom: rom.data }, signal, rom.path);
+    } finally { this.reads--; }
   }
-
-  /**
-   * Presses a GameBoy button for a single frame.
-   * @param button The button to press.
-   * @param durationFrames The number of frames to press the button.
-   * @returns The screen content after pressing the button.
-   * @throws Error if no ROM is loaded.
-   */
-  pressButton(button: GameBoyButton, durationFrames: number): ImageContent {
-    log.debug(`Pressing button: ${button}`);
-    if (!this.isRomLoaded()) {
-      log.warn('Attempted to press button with no ROM loaded');
-      throw new Error('No ROM loaded');
-    }
-    this.emulator.pressButton(button, durationFrames); // This advances one frame
-    return this.getScreen();
+  advance(frames: number, signal?: AbortSignal): Promise<FrameResult> {
+    this.validateFrames(frames);
+    return this.submit({ operation: 'advance', frames }, signal);
   }
-
-  /**
-   * Waits (advances) for a specified number of frames.
-   * @param durationFrames The number of frames to wait.
-   * @returns The screen content after waiting.
-   * @throws Error if no ROM is loaded.
-   */
-  waitFrames(durationFrames: number): ImageContent {
-    log.debug(`Waiting for ${durationFrames} frames`);
-    if (!this.isRomLoaded()) {
-      log.warn('Attempted to wait frames with no ROM loaded');
-      throw new Error('No ROM loaded');
-    }
-    for (let i = 0; i < durationFrames; i++) {
-      this.emulator.doFrame();
-    }
-    log.verbose(`Waited ${durationFrames} frames`, JSON.stringify({ frames: durationFrames }));
-    return this.getScreen();
+  pressButton(button: GameBoyButton, frames: number, signal?: AbortSignal): Promise<FrameResult> {
+    this.validateFrames(frames);
+    if (!BUTTONS.includes(button)) return Promise.reject(new Error('Unknown button.'));
+    return this.submit({ operation: 'press', frames, button }, signal);
   }
-
-  /**
-   * Gets the current GameBoy screen as base64 PNG data.
-   * Does NOT advance a frame.
-   * @returns The screen content.
-   * @throws Error if no ROM is loaded.
-   */
-  getScreen(): ImageContent {
-    log.verbose('Getting current screen');
-    if (!this.isRomLoaded()) {
-      log.warn('Attempted to get screen with no ROM loaded');
-      throw new Error('No ROM loaded');
-    }
-    const screenBase64 = this.emulator.getScreenAsBase64();
-    const screen: ImageContent = {
-      type: 'image',
-      data: screenBase64,
-      mimeType: 'image/png'
-    };
-    log.verbose('Screen data retrieved', JSON.stringify({ mimeType: screen.mimeType, dataLength: screen.data.length }));
-    return screen;
+  private validateFrames(frames: number): void {
+    if (!Number.isInteger(frames) || frames < 1 || frames > 600) throw new Error('Frames must be an integer from 1 to 600.');
   }
-
-  /**
-   * Advances the emulator by one frame and returns the new screen.
-   * @returns The screen content after advancing one frame.
-   * @throws Error if no ROM is loaded.
-   */
-  advanceFrameAndGetScreen(): ImageContent {
-    log.verbose('Advancing one frame and getting screen');
-    if (!this.isRomLoaded()) {
-      log.warn('Attempted to advance frame with no ROM loaded');
-      throw new Error('No ROM loaded');
+  private submit(request: Omit<WorkerRequest, 'id'>, signal?: AbortSignal, romPath?: string): Promise<FrameResult> {
+    if (this.closed) return Promise.reject(new Error('Emulator is closed.'));
+    if (signal?.aborted) return Promise.reject(new Error('Operation cancelled.'));
+    if (this.queue.length >= (this.options.maxQueued ?? 16)) return Promise.reject(new Error('Emulator queue is full; retry after pending operations finish.'));
+    return new Promise((resolve, reject) => {
+      const job: Job = { request: { ...request, id: this.nextId++ }, resolve, reject, signal, romPath };
+      job.abort = () => {
+        if (this.active === job) this.reset(new Error('Operation cancelled; emulator reset. Reload the ROM before continuing.'));
+        else { this.queue = this.queue.filter(item => item !== job); this.finish(job, new Error('Operation cancelled.')); }
+      };
+      signal?.addEventListener('abort', job.abort, { once: true });
+      this.queue.push(job); this.pump();
+    });
+  }
+  private pump(): void {
+    if (this.closed || this.active || !this.queue.length) return;
+    if (!this.worker) {
+      const worker = new Worker(new URL('./emulator-worker.js', import.meta.url), {
+        stdout: true, stderr: true, execArgv: [], resourceLimits: { maxOldGenerationSizeMb: 128, maxYoungGenerationSizeMb: 32, stackSizeMb: 4 }
+      });
+      // Legacy emulator logs must never reach MCP stdout or grow an unbounded file.
+      worker.stdout.resume(); worker.stderr.resume();
+      worker.on('message', (response: WorkerResponse) => {
+        if (this.worker !== worker || this.active?.request.id !== response.id) return;
+        const job = this.active; this.active = undefined;
+        if (response.error || !response.result) this.finish(job, new Error(response.error ?? 'Invalid worker response.'));
+        else {
+          this.snapshot = response.result;
+          if (job.romPath) this.romPath = job.romPath;
+          this.finish(job, undefined, response.result);
+        }
+        this.pump();
+      });
+      worker.on('error', () => { if (this.worker === worker) this.reset(new Error('Emulator worker failed; reload the ROM.')); });
+      worker.on('exit', () => { if (this.worker === worker) this.reset(new Error('Emulator worker stopped; reload the ROM.')); });
+      this.worker = worker;
     }
-    this.emulator.doFrame();
-    return this.getScreen();
+    const job = this.queue.shift()!; this.active = job;
+    job.timer = setTimeout(() => this.reset(new Error('Emulator operation timed out and was stopped; reload the ROM.')),
+      job.request.operation === 'load' ? (this.options.loadTimeoutMs ?? 5000) : (this.options.operationTimeoutMs ?? 2000));
+    this.worker.postMessage(job.request);
+  }
+  private finish(job: Job, error?: Error, result?: FrameResult): void {
+    clearTimeout(job.timer);
+    if (job.abort) job.signal?.removeEventListener('abort', job.abort);
+    if (error) job.reject(error); else job.resolve(result!);
+  }
+  private reset(error: Error): void {
+    const worker = this.worker; this.worker = undefined;
+    const jobs = [...(this.active ? [this.active] : []), ...this.queue];
+    this.active = undefined; this.queue = []; this.snapshot = undefined; this.romPath = undefined;
+    for (const job of jobs) this.finish(job, error);
+    void worker?.terminate();
+  }
+  async close(): Promise<void> {
+    this.closed = true;
+    const worker = this.worker;
+    this.reset(new Error('Emulator closed.'));
+    if (worker) await worker.terminate();
   }
 }

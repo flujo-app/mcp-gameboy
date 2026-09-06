@@ -1,0 +1,7 @@
+{
+  "name": "serverboy",
+  "version": "0.0.7",
+  "type": "commonjs",
+  "private": true,
+  "license": "GPL-2.0-only"
+}

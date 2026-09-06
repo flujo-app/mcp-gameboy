@@ -1,29 +1,22 @@
 # syntax=docker/dockerfile:1
-FROM node:lts-alpine
-
-# Install build dependencies for canvas
-RUN apk add --no-cache python3 make g++ cairo-dev pango-dev jpeg-dev giflib-dev
-
-# Set working directory
+FROM node:24-bookworm-slim AS build
 WORKDIR /app
-
-# Copy package files first for better caching
+ENV PUPPETEER_SKIP_DOWNLOAD=true
 COPY package.json package-lock.json ./
-
-# Install all dependencies (including dev dependencies needed for build)
 RUN npm ci
+COPY tsconfig.json ./
+COPY src ./src
+COPY vendor ./vendor
+RUN npm run build && npm prune --omit=dev
 
-# Copy source code and ROM files
-COPY . .
-
-# Make sure the ROM directory exists
-RUN mkdir -p roms
-
-# Build TypeScript
-RUN npm run build
-
-# Create .env file with default configuration
-RUN echo "SERVER_PORT=3001\nROM_PATH=./roms/dangan.gb" > .env
-
-# Default command uses stdio transport
-CMD ["node", "dist/index.js"]
+FROM node:24-bookworm-slim
+ENV NODE_ENV=production ROM_DIR=/data/roms
+WORKDIR /app
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+COPY --from=build /app/vendor ./vendor
+COPY package.json LICENSE THIRD_PARTY_NOTICES.md README.md ./
+RUN mkdir -p /data/roms && chown -R node:node /data
+USER node
+EXPOSE 3001
+ENTRYPOINT ["node", "dist/index.js"]

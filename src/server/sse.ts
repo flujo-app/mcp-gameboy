@@ -1,163 +1,110 @@
-import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
-import { GameBoyEmulator } from '../gameboy';
-import { EmulatorService } from '../emulatorService'; // Import EmulatorService
-import { createGameBoyServer } from './server';
-import express, { Request, Response } from 'express';
-import path from 'path';
-import fs from 'fs';
-import http from 'http';
+import express from 'express';
+import type { ErrorRequestHandler } from 'express';
+import http from 'node:http';
 import multer from 'multer';
-import { setupWebUI, setupRomSelectionUI } from '../ui';
-import { log } from '../utils/logger';
+import { createMcpHandler } from '@modelcontextprotocol/server';
+import { toNodeHandler } from '@modelcontextprotocol/node';
+import { SSEServerTransport } from '@modelcontextprotocol/server-legacy/sse';
+import { EmulatorService } from '../emulatorService.js';
+import { MAX_ROM_BYTES } from '../romRepository.js';
+import { invokeTool } from '../tools.js';
+import { createGameBoyServer } from './server.js';
+import { operatorGuard, httpBoundary } from '../http-security.js';
+import { setupWebUI } from '../ui.js';
 
-/**
- * Start the GameBoy MCP server in SSE mode
- * @param port Port to listen on (defaults to SERVER_PORT from .env or 3001)
- */
-export async function startSseServer(port?: number): Promise<void> {
-  // Use SERVER_PORT from environment variables if port is not provided
-  const ssePort = port || (process.env.SERVER_PORT ? parseInt(process.env.SERVER_PORT, 10) : 3001);
-  const webUiPort = process.env.SERVER_PORT ? parseInt(process.env.SERVER_PORT, 10) : 3002;
-  
-  // Create the emulator
-  const emulator = new GameBoyEmulator();
-  // Create the emulator service
-  const emulatorService = new EmulatorService(emulator);
-  
-  // Create the server using the service
-  const server = createGameBoyServer(emulatorService);
-  
-  // Create the Express app
+export function createHttpApp(service: EmulatorService, origin: string, token?: string) {
   const app = express();
-  
-  // Middleware
-  app.use(express.static(path.join(process.cwd(), 'public')));
-  app.use(express.json());
-  
-  // Configure multer for file uploads
-  const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-      const romsDir = path.join(process.cwd(), 'roms');
-      if (!fs.existsSync(romsDir)) {
-        fs.mkdirSync(romsDir);
-      }
-      cb(null, romsDir);
-    },
-    filename: (req, file, cb) => {
-      cb(null, file.originalname);
-    }
+  app.disable('x-powered-by');
+  app.use(httpBoundary(origin));
+  const guard = operatorGuard(token);
+  app.get('/health', (_req, res) => { res.json({ status: 'ok' }); });
+  setupWebUI(app);
+  app.use(guard);
+  app.use(express.json({ limit: '32kb' }));
+  const handle = toNodeHandler(createMcpHandler(() => createGameBoyServer(service), { legacy: 'stateless' }));
+  const sessions = new Map<string, { transport: SSEServerTransport; server: ReturnType<typeof createGameBoyServer>; timer: ReturnType<typeof setTimeout> }>();
+  const drop = async (id: string) => {
+    const item = sessions.get(id);
+    if (!item) return;
+    sessions.delete(id); clearTimeout(item.timer);
+    await item.server.close();
+  };
+  const resetTimer = (id: string) => {
+    const item = sessions.get(id);
+    if (!item) return;
+    clearTimeout(item.timer);
+    item.timer = setTimeout(() => { void drop(id); }, 10 * 60 * 1000);
+    item.timer.unref();
+  };
+  const sse: express.RequestHandler = async (req, res, next) => {
+    if (sessions.size >= 32) { res.status(503).json({ error: 'SSE session limit reached.' }); return; }
+    const transport = new SSEServerTransport('/messages', res);
+    const server = createGameBoyServer(service);
+    const id = transport.sessionId;
+    const timer = setTimeout(() => { void drop(id); }, 10 * 60 * 1000); timer.unref();
+    sessions.set(id, { transport, server, timer });
+    res.on('close', () => { void drop(id); });
+    try { await server.connect(transport); }
+    catch (error) { await drop(id); next(error); }
+  };
+  app.get('/sse', sse);
+  app.get('/mcp', (req, res, next) => {
+    if (!req.get('mcp-protocol-version')) return sse(req, res, next);
+    return handle(req, res, req.body).catch(next);
   });
-  
-  const upload = multer({ storage });
-  
-  // Store transports by session ID
-  const transports: Record<string, SSEServerTransport> = {};
-  
-  // SSE endpoint for establishing the stream
-  app.get('/mcp', async (req: Request, res: Response) => {
-    log.info('Received GET request to /mcp (establishing SSE stream)');
-    
-    try {
-      // Create a new SSE transport for the client
-      const transport = new SSEServerTransport('/messages', res);
-      
-      // Store the transport by session ID
-      const sessionId = transport.sessionId;
-      transports[sessionId] = transport;
-      
-      // Set up onclose handler to clean up transport when closed
-      transport.onclose = () => {
-        log.info(`SSE transport closed for session ${sessionId}`);
-        delete transports[sessionId];
-      };
-      
-      // Connect the transport to the MCP server
-      await server.connect(transport);
-      
-      log.info(`Established SSE stream with session ID: ${sessionId}`);
-    } catch (error) {
-      log.error('Error establishing SSE stream:', error);
-      if (!res.headersSent) {
-        res.status(500).send('Error establishing SSE stream');
-      }
-    }
+  app.post('/messages', async (req, res) => {
+    const id = typeof req.query.sessionId === 'string' ? req.query.sessionId : '';
+    const item = sessions.get(id);
+    if (!item) { res.status(404).json({ error: 'SSE session not found.' }); return; }
+    resetTimer(id);
+    await item.transport.handlePostMessage(req, res, req.body);
   });
-  
-  // Messages endpoint for receiving client JSON-RPC requests
-  app.post('/messages', async (req: Request, res: Response) => {
-    log.info('Received POST request to /messages');
-    
-    // Extract session ID from URL query parameter
-    const sessionId = req.query.sessionId as string | undefined;
-    
-    if (!sessionId) {
-      log.error('No session ID provided in request URL');
-      res.status(400).send('Missing sessionId parameter');
-      return;
-    }
-    
-    const transport = transports[sessionId];
-    if (!transport) {
-      log.error(`No active transport found for session ID: ${sessionId}`);
-      res.status(404).send('Session not found');
-      return;
-    }
-    
-    try {
-      // Handle the POST message with the transport
-      await transport.handlePostMessage(req, res, req.body);
-    } catch (error) {
-      log.error('Error handling request:', error);
-      if (!res.headersSent) {
-        res.status(500).send('Error handling request');
-      }
-    }
+  app.all('/mcp', (req, res, next) => { void handle(req, res, req.body).catch(next); });
+  app.get('/api/status', (_req, res) => { res.json(service.status()); });
+  app.get('/api/roms', async (_req, res) => { res.json(await service.roms.list()); });
+  app.get('/screen', (_req, res) => { res.type('png').send(Buffer.from(service.getScreen().png, 'base64')); });
+  app.post('/api/advance_and_get_screen', async (_req, res) => { const frame = await service.advance(1); res.type('png').send(Buffer.from(frame.png, 'base64')); });
+  app.get(['/api/advance_and_get_screen', '/gameboy'], (_req, res) => { res.set('Allow', 'POST').status(405).json({ error: 'Use an authenticated POST.' }); });
+  app.post('/api/tool', async (req, res) => {
+    if (!req.body || typeof req.body.tool !== 'string') { res.status(400).json({ error: 'Expected tool and arguments.' }); return; }
+    const controller = new AbortController();
+    res.on('close', () => { if (!res.writableEnded) controller.abort(); });
+    res.json(await invokeTool(service, req.body.tool, req.body.arguments ?? req.body.args, controller.signal));
   });
-  
-  // Set up the ROM selection UI using the service
-  setupRomSelectionUI(app, emulatorService); // Pass service, remove emulator
-  
-  // Handle ROM upload
-  app.post('/upload', upload.single('rom'), (req, res) => {
-    // Redirect to the ROM selection page
-    res.redirect('/');
+  app.post('/gameboy', async (req, res) => { res.json(await invokeTool(service, 'load_rom', { romPath: req.body?.rom }, undefined)); });
+  let uploads = 0;
+  const upload = multer({ storage: multer.memoryStorage(), preservePath: true, limits: { fileSize: MAX_ROM_BYTES, files: 1, fields: 0, parts: 2 } }).single('rom');
+  app.post('/upload', (req, res, next) => {
+    if (uploads >= 4) { res.status(503).json({ error: 'Upload capacity reached.' }); return; }
+    uploads++;
+    let released = false;
+    const release = () => { if (!released) { released = true; uploads--; } };
+    res.once('close', release); res.once('finish', release);
+    upload(req, res, error => {
+      if (error) { next(error); return; }
+      if (!req.file) { res.status(400).json({ error: 'A ROM file is required.' }); return; }
+      void service.roms.upload(req.file.originalname, req.file.buffer)
+        .then(path => { res.status(201).json({ path }); }).catch(next);
+    });
   });
-  
-  // Create the GameBoy page
-  app.get('/gameboy', (req, res) => {
-    const romPath = req.query.rom as string;
-    
-    // Check if the ROM file exists
-    if (!romPath || !fs.existsSync(romPath)) {
-      res.redirect('/');
-      return;
-    }
-    
-    // Load the ROM using the service
-    try {
-      emulatorService.loadRom(romPath); // Use service
-      
-      // NOTE: setupWebUI should ideally be called only ONCE during setup,
-      // not within a route handler. Let's move it outside.
-      // We'll set it up after the ROM selection UI.
-      
-      // Redirect to the emulator page - the UI will fetch the screen
-      res.redirect('/emulator'); 
-    } catch (error) {
-      log.error(`Error loading ROM: ${error}`, error);
-      res.redirect('/'); // Redirect back to selection on error
-    }
-  });
-
-  // Set up the main Web UI (needs to be done once)
-  // Pass the service instance. The optional romPath isn't strictly needed here
-  // as the UI gets the current ROM from the service via API.
-  setupWebUI(app, emulatorService); 
-  
-  // Start the Express server
-  const httpServer = http.createServer(app);
-  httpServer.listen(ssePort, () => {
-    log.info(`GameBoy MCP Server listening on http://localhost:${ssePort}`);
-    log.info(`GameBoy Web UI available at http://localhost:${webUiPort}`);
-  });
+  app.use((_req, res) => { res.status(404).json({ error: 'Not found.' }); });
+  const errors: ErrorRequestHandler = (error, _req, res, _next) => {
+    if (res.headersSent) return;
+    const tooLarge = error?.code === 'LIMIT_FILE_SIZE' || error?.type === 'entity.too.large';
+    res.status(tooLarge ? 413 : 400).json({ error: error instanceof Error ? error.message : 'Request failed.' });
+  };
+  app.use(errors);
+  return { app, close: async () => { await Promise.all([...sessions.keys()].map(drop)); } };
+}
+export async function startHttpServer(service: EmulatorService, host: string, port: number, origin: string) {
+  const application = createHttpApp(service, origin);
+  const server = http.createServer(application.app);
+  server.requestTimeout = 15000;
+  server.headersTimeout = 10000;
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(port, host, resolve); });
+  return { server, close: async () => {
+    await application.close();
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  } };
 }

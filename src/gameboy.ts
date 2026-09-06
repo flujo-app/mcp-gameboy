@@ -1,120 +1,40 @@
-import { GameBoyButton } from './types';
-import * as fs from 'fs';
-import * as path from 'path';
-import { createCanvas, Canvas } from 'canvas';
-import { log } from './utils/logger';
+import { createRequire } from 'node:module';
+import { PNG } from 'pngjs';
+import type { FrameResult, GameBoyButton } from './types.js';
 
-// Import the serverboy library
-const Gameboy = require('serverboy');
+interface Core { loadRom(data: Uint8Array): void; doFrame(): void; pressKey(key: string): void; getScreen(): ArrayLike<number>; }
+const require = createRequire(import.meta.url);
+const Gameboy = require('../vendor/serverboy/src/interface.js') as new () => Core;
 
+/** This module is imported only by the isolated worker. */
 export class GameBoyEmulator {
-  private gameboy: any;
-  private canvas: Canvas;
-  private romLoaded: boolean = false;
-  private romPath?: string;
-
-  constructor() {
-    this.gameboy = new Gameboy();
-    // Create a canvas for rendering the screen
-    this.canvas = createCanvas(160, 144);
+  private core?: Core;
+  private frames = 0;
+  load(data: Uint8Array): FrameResult {
+    const candidate = new Gameboy();
+    candidate.loadRom(Buffer.from(data));
+    for (let i = 0; i < 5; i++) candidate.doFrame();
+    const previous = this.core; const previousFrames = this.frames;
+    this.core = candidate; this.frames = 5;
+    try { return this.screen(); }
+    catch (error) { this.core = previous; this.frames = previousFrames; throw error; }
   }
-
-  /**
-   * Load a ROM file
-   * @param romPath Path to the ROM file
-   */
-  public loadRom(romPath: string): void {
-    try {
-      const rom = fs.readFileSync(romPath);
-      this.gameboy.loadRom(rom);
-      this.romLoaded = true;
-      this.romPath = romPath;
-      log.info(`ROM loaded: ${path.basename(romPath)}`);
-    } catch (error) {
-      log.error(`Error loading ROM: ${error}`);
-      throw new Error(`Failed to load ROM: ${error}`);
+  advance(frames: number, button?: GameBoyButton): FrameResult {
+    if (!this.core) throw new Error('No ROM loaded.');
+    for (let i = 0; i < frames; i++) {
+      if (button) this.core.pressKey(button);
+      this.core.doFrame();
+      this.frames++;
     }
+    // Preserve the original release frame after a button operation.
+    if (button) { this.core.doFrame(); this.frames++; }
+    return this.screen();
   }
-
-  /**
-   * Press a button on the GameBoy
-   * @param button Button to press
-   */
-  public pressButton(button: GameBoyButton, durationFrames: number = 1): void {
-    if (!this.romLoaded) {
-      throw new Error('No ROM loaded');
-    }
-
-    // Map our button enum to serverboy's keymap
-    const buttonMap: Record<GameBoyButton, number> = {
-      [GameBoyButton.UP]: Gameboy.KEYMAP.UP,
-      [GameBoyButton.DOWN]: Gameboy.KEYMAP.DOWN,
-      [GameBoyButton.LEFT]: Gameboy.KEYMAP.LEFT,
-      [GameBoyButton.RIGHT]: Gameboy.KEYMAP.RIGHT,
-      [GameBoyButton.A]: Gameboy.KEYMAP.A,
-      [GameBoyButton.B]: Gameboy.KEYMAP.B,
-      [GameBoyButton.START]: Gameboy.KEYMAP.START,
-      [GameBoyButton.SELECT]: Gameboy.KEYMAP.SELECT
-    };
-
-    for (let i=0; i < durationFrames; i++) {
-      this.gameboy.pressKeys([buttonMap[button]]);
-      this.gameboy.doFrame();
-    }
-
-    // for now: advance one frame so we dont "hold" the button all the time.
-    this.gameboy.doFrame();
-  }
-
-  /**
-   * Advance the emulation by one frame
-   */
-  public doFrame(): void {
-    if (!this.romLoaded) {
-      throw new Error('No ROM loaded');
-    }
-    this.gameboy.doFrame();
-  }
-
-  /**
-   * Get the current screen as a base64 encoded PNG
-   * @returns Base64 encoded PNG image
-   */
-  public getScreenAsBase64(): string {
-    if (!this.romLoaded) {
-      throw new Error('No ROM loaded');
-    }
-
-    // Get the raw screen data
-    const screenData = this.gameboy.getScreen();
-    
-    // Draw to canvas
-    const ctx = this.canvas.getContext('2d');
-    const imageData = ctx.createImageData(160, 144);
-    
-    for (let i = 0; i < screenData.length; i++) {
-      imageData.data[i] = screenData[i];
-    }
-    
-    ctx.putImageData(imageData, 0, 0);
-    
-    // Convert to base64 PNG
-    return this.canvas.toDataURL('image/png').split(',')[1];
-  }
-
-  /**
-   * Get the current ROM path
-   * @returns Current ROM path or undefined if no ROM is loaded
-   */
-  public getRomPath(): string | undefined {
-    return this.romPath;
-  }
-
-  /**
-   * Check if a ROM is loaded
-   * @returns True if a ROM is loaded, false otherwise
-   */
-  public isRomLoaded(): boolean {
-    return this.romLoaded;
+  private screen(): FrameResult {
+    const pixels = this.core!.getScreen();
+    if (pixels.length !== 160 * 144 * 4) throw new Error('Emulator returned an invalid screen.');
+    const png = new PNG({ width: 160, height: 144 });
+    png.data = Buffer.from(pixels);
+    return { png: PNG.sync.write(png).toString('base64'), frames: this.frames };
   }
 }
