@@ -13,19 +13,24 @@ it.skipIf(process.env.RUN_BROWSER_TESTS !== 'true')('real browser authenticates,
     const page = await browser.newPage(); const errors = [];
     page.on('pageerror', error => errors.push(error.message));
     await page.goto(f.origin);
+    const settled = () => page.waitForFunction(() => document.querySelector('#controls').getAttribute('aria-busy') === 'false');
     await page.type('#token', TOKEN);
     await page.click('#connect button');
     await page.waitForFunction(() => !document.querySelector('#controls').hidden);
+    await settled();
     expect(await page.$eval('#token', element => element.value)).toBe('');
     expect(await page.evaluate(() => ({ local: localStorage.length, session: sessionStorage.length, cookies: document.cookie, url: location.href }))).toEqual({ local: 0, session: 0, cookies: '', url: f.origin + '/' });
     await page.select('#roms', (await import('node:path')).default.join(f.directory, 'homebrew.gb'));
     await page.click('#load');
     await page.waitForFunction(() => document.querySelector('#cartridge').textContent.includes('5 frames'));
+    await settled();
     await page.click('[data-button="a"]');
     await page.waitForFunction(() => document.querySelector('#cartridge').textContent.includes('31 frames'));
+    await settled();
     expect(f.service.status().frames).toBe(31);
     await page.click('#skip');
     await page.waitForFunction(() => document.querySelector('#cartridge').textContent.includes('131 frames'));
+    await settled();
     // Upload an actual generated cartridge through the browser's multipart form.
     const input = await page.$('#file');
     await mkdir(path.join(f.directory, 'source'));
@@ -34,9 +39,11 @@ it.skipIf(process.env.RUN_BROWSER_TESTS !== 'true')('real browser authenticates,
     await input.uploadFile(source);
     await page.click('#upload button');
     await page.waitForFunction(() => [...document.querySelector('#roms').options].some(option => option.textContent === 'uploaded.gb'));
+    await settled();
     await page.select('#roms', path.join(f.directory, 'uploaded.gb'));
     await page.click('#load');
     await page.waitForFunction(() => document.querySelector('#cartridge').textContent.includes('uploaded.gb'));
+    await settled();
     await page.click('#autoplay');
     await page.waitForFunction(() => Number(document.querySelector('#cartridge').textContent.match(/(\d+) frames/)[1]) > 8);
     await page.click('#autoplay');

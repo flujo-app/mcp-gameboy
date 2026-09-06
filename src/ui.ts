@@ -3,14 +3,24 @@ import type { Express } from 'express';
 
 const script = String.raw`
 let token = '';
+let generation = 0;
+let connection = new AbortController();
 let timer;
 let busy = false;
 let imageUrl;
 const byId = id => document.getElementById(id);
 const status = message => { byId('status').textContent = message; };
+function setBusy(value) {
+  busy = value;
+  byId('controls').setAttribute('aria-busy', String(value));
+  for (const button of document.querySelectorAll('button')) if (button.id !== 'disconnect') button.disabled = value;
+}
+function current(epoch) { if (epoch !== generation) throw new Error('Connection ended.'); }
 async function api(path, options = {}) {
+  const epoch = generation;
   const headers = { ...options.headers, Authorization: 'Bearer ' + token };
-  const response = await fetch(path, { ...options, headers, cache: 'no-store' });
+  const response = await fetch(path, { ...options, headers, cache: 'no-store', signal: connection.signal });
+  current(epoch);
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}));
     throw new Error(payload.error || 'Request failed: ' + response.status);
@@ -18,24 +28,32 @@ async function api(path, options = {}) {
   return response;
 }
 async function showScreen() {
+  const epoch = generation;
   const response = await api('/screen');
   const blob = await response.blob();
+  current(epoch);
   if (imageUrl) URL.revokeObjectURL(imageUrl);
   imageUrl = URL.createObjectURL(blob);
   byId('screen').src = imageUrl;
 }
 async function refresh() {
+  const epoch = generation;
   const state = await (await api('/api/status')).json();
+  current(epoch);
   byId('cartridge').textContent = state.romLoaded ? state.romPath.split(/[\\/]/).pop() + ' · ' + state.frames + ' frames' : 'No ROM loaded';
   if (state.romLoaded) await showScreen();
 }
 async function tool(name, args = {}) {
+  const epoch = generation;
   const result = await (await api('/api/tool', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tool: name, arguments: args }) })).json();
+  current(epoch);
   if (result.isError) throw new Error(result.content[0].text);
   await refresh();
 }
 async function list() {
+  const epoch = generation;
   const roms = await (await api('/api/roms')).json();
+  current(epoch);
   byId('roms').replaceChildren();
   for (const rom of roms) {
     const option = document.createElement('option');
@@ -44,16 +62,18 @@ async function list() {
 }
 async function action(callback) {
   if (busy) return;
-  busy = true;
-  try { await callback(); status('Ready'); } catch (error) { status(error.message); byId('autoplay').checked = false; }
-  finally { busy = false; }
+  setBusy(true); status('Working…');
+  const epoch = generation;
+  try { await callback(); if (epoch === generation) status('Ready'); } catch (error) { if (epoch === generation) { status(error.message); byId('autoplay').checked = false; } }
+  finally { if (epoch === generation) setBusy(false); }
 }
 byId('connect').addEventListener('submit', event => {
   event.preventDefault();
+  connection.abort(); connection = new AbortController(); generation++; setBusy(false);
   token = byId('token').value; byId('token').value = '';
   action(async () => { await refresh(); await list(); byId('controls').hidden = false; byId('connect').hidden = true; });
 });
-byId('disconnect').onclick = () => { token = ''; byId('controls').hidden = true; byId('connect').hidden = false; byId('autoplay').checked = false; clearTimeout(timer); byId('roms').replaceChildren(); byId('cartridge').textContent = ''; if (imageUrl) URL.revokeObjectURL(imageUrl); byId('screen').removeAttribute('src'); status('Disconnected'); };
+byId('disconnect').onclick = () => { token = ''; generation++; connection.abort(); setBusy(false); byId('controls').hidden = true; byId('connect').hidden = false; byId('autoplay').checked = false; clearTimeout(timer); byId('roms').replaceChildren(); byId('cartridge').textContent = ''; if (imageUrl) URL.revokeObjectURL(imageUrl); byId('screen').removeAttribute('src'); status('Disconnected'); };
 byId('load').onclick = () => action(() => tool('load_rom', { romPath: byId('roms').value }));
 byId('upload').addEventListener('submit', event => {
   event.preventDefault();
@@ -67,12 +87,13 @@ byId('upload').addEventListener('submit', event => {
 for (const button of document.querySelectorAll('[data-button]')) button.onclick = () => action(() => tool('press_' + button.dataset.button, { duration_frames: Number(byId('frames').value) }));
 byId('skip').onclick = () => action(() => tool('wait_frames', { duration_frames: 100 }));
 async function tick() {
+  const epoch = generation;
   if (!byId('autoplay').checked || !token) return;
   if (!busy) await action(() => tool('get_screen'));
-  timer = setTimeout(tick, 17);
+  if (epoch === generation && byId('autoplay').checked && token) timer = setTimeout(tick, 17);
 }
 byId('autoplay').onchange = () => { clearTimeout(timer); if (byId('autoplay').checked) tick(); };
-window.addEventListener('pagehide', () => { token = ''; clearTimeout(timer); if (imageUrl) URL.revokeObjectURL(imageUrl); });
+window.addEventListener('pagehide', () => { token = ''; generation++; connection.abort(); clearTimeout(timer); if (imageUrl) URL.revokeObjectURL(imageUrl); });
 `;
 export function setupWebUI(app: Express): void {
   const hash = createHash('sha256').update(script).digest('base64');

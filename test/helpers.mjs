@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, writeFile, rm, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { RomRepository } from '../dist/romRepository.js';
@@ -10,7 +10,7 @@ import { homebrewRom } from '../scripts/homebrew.mjs';
 export const TOKEN = 'fixture_operator_key_012345678901234567890';
 export const meta = { 'io.modelcontextprotocol/protocolVersion': '2026-07-28', 'io.modelcontextprotocol/clientInfo': { name: 'regression', version: '1' }, 'io.modelcontextprotocol/clientCapabilities': {} };
 export async function fixture(options) {
-  const directory = await mkdtemp(path.join(tmpdir(), 'gameboy-test-'));
+  const directory = await realpath(await mkdtemp(path.join(tmpdir(), 'gameboy-test-')));
   await writeFile(path.join(directory, 'homebrew.gb'), homebrewRom());
   const roms = await RomRepository.create(directory);
   const service = new EmulatorService(roms, options);

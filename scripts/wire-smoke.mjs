@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, writeFile, rm, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,6 +9,8 @@ import { homebrewRom } from './homebrew.mjs';
 export async function wireSmoke(entry, modern, preload = false, dockerImage) {
   const directory = await mkdtemp(path.join(tmpdir(), 'gb-wire-'));
   await writeFile(path.join(directory, 'homebrew.gb'), homebrewRom());
+  // The generated read-only fixture is shared with the container's nonroot UID.
+  if (dockerImage) await chmod(directory, 0o755);
   const command = dockerImage ? 'docker' : process.execPath;
   const args = dockerImage ? ['run', '--rm', '-i', '--mount', 'type=bind,source=' + directory + ',target=/data/roms,readonly',
     '--env', 'ROM_DIR=/data/roms', ...(preload ? ['--env', 'ROM_PATH=/data/roms/homebrew.gb'] : []), dockerImage] : [path.resolve(entry), '--stdio'];
